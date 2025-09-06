@@ -3,17 +3,17 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 #hyperparameters
-batch_size = 32 #how many independent sequences will we process in parallel? 
-block_size = 8 #what is the maximum context length for predictions? (i.e. how many characters do we feed into the model to predict the next character?)
+batch_size = 64 #how many independent sequences will we process in parallel? 
+block_size = 256 #what is the maximum context length for predictions? (i.e. how many characters do we feed into the model to predict the next character?)
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 32
-# n_head = 4
-# n_layer = 4
-# dropout = 0.0
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 # ----------------------------------
 
 torch.manual_seed(1337) #for reproducibility 👉 Without torch.manual_seed(...), each run would give different random values.
@@ -26,7 +26,7 @@ with open('input.txt', 'r', encoding='utf-8') as f:
 #here are all the unique characters that occur in this text
 chars = sorted(list(set(text))) # 👉 \n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
 vocab_size = len(chars) #the number of unique characters in the text
-print("".join(chars))
+# print("".join(chars))
 
 # create a mapping from characters to integers
 stoi = { ch:i for i,ch in enumerate(chars) } #string to integer mapping by enumerating over the chars {'\n': 0, ' ': 1, '!': 2, '$': 3, '&': 4, ...}
@@ -82,6 +82,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -92,6 +93,7 @@ class Head(nn.Module):
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
         # softmax the attention scores
         wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
         # perform the weighted aggregation of the values
         v = self.value(x) # (B,T,C)
         out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
@@ -103,7 +105,7 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         out = torch.cat([h(x) for h in self.heads], dim=-1)
@@ -119,7 +121,7 @@ class FeedFoward(nn.Module):
             nn.Linear(n_embd, 4 * n_embd), #expand the embedding dimension by 4x
             nn.ReLU(), #non-linearity
             nn.Linear(4 * n_embd, n_embd), #project back to the original embedding dimension
-            # nn.Dropout(dropout),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -134,10 +136,12 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size) # i.e. 4 heads of 8-dimensional self-attention
         self.ffwd = FeedFoward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
-        x = x + self.sa(x) # (B,T,C)
-        x = x + self.ffwd(x) # (B,T,C)
+        x = x + self.sa(self.ln1(x)) # (B,T,C)
+        x = x + self.ffwd(self.ln2(x)) # (B,T,C)
         return x
 
 # Define a simple Bigram model
@@ -147,11 +151,8 @@ class BigramLanguageModel(nn.Module):
         # Each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) #embedding table to convert token indices to vectors of size n_embd
         self.positional_embedding_table = nn.Embedding(block_size, n_embd) #embedding table to convert position indices to vectors of size n_embd
-        self.block = nn.Sequential(
-            Block( n_embd, 4), #stack of n_layer blocks of transformer
-            Block( n_embd, 4),
-            Block( n_embd, 4), # TODO: make this a loop
-        )
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd) # final layer norm
         self.lm_head = nn.Linear(n_embd, vocab_size) #linear layer to project the embeddings to the vocabulary size
 
     def forward(self, idx, targets=None):
@@ -162,7 +163,8 @@ class BigramLanguageModel(nn.Module):
         pos = torch.arange(T, device=device) # (T,) tensor of integers from 0 to T-1
         pos_emb = self.positional_embedding_table(pos) # (T,C)
         x = token_emb + pos_emb # (B,T,C) -> This is broadcasting (T,C) to (B,T,C) # x holds the token embeddings and positional embeddings
-        x = self.block(x) # (B,T,C) # apply the transformer blocks
+        x = self.blocks(x) # (B,T,C) # apply the transformer blocks
+        x = self.ln_f(x) # (B,T,C) # apply final layer norm
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
@@ -203,7 +205,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 for iter in range(max_iters):
 
     # every once in a while evaluate the loss on train and val sets
-    if iter % eval_interval == 0:
+    if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"Iteration {iter}: Train loss {losses['train']:}, Val loss {losses['val']}")
 
@@ -222,3 +224,11 @@ for iter in range(max_iters):
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device) # start with a single zero token
 print(decode(model.generate(context, max_new_tokens=500)[0].tolist())) #generate
+
+# Save model
+torch.save(model.state_dict(), "shakespeare_model.pt")
+
+# # Recreate model architecture
+# model = BigramLanguageModel().to(device)
+# model.load_state_dict(torch.load("shakespeare_model.pt", map_location=device))
+# model.eval()
