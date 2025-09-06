@@ -96,6 +96,49 @@ class Head(nn.Module):
         v = self.value(x) # (B,T,C)
         out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
         return out
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self-attention in parallel """
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+class FeedFoward(nn.Module):
+    """ a simple linear layer followed by a non-linearity """
+
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd), #expand the embedding dimension by 4x
+            nn.ReLU(), #non-linearity
+            nn.Linear(4 * n_embd, n_embd), #project back to the original embedding dimension
+            # nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation """
+
+    def __init__(self, n_embd, n_head):
+        # n_embd: embedding dimension, head_size: the dimension of each head
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size) # i.e. 4 heads of 8-dimensional self-attention
+        self.ffwd = FeedFoward(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(x) # (B,T,C)
+        x = x + self.ffwd(x) # (B,T,C)
+        return x
 
 # Define a simple Bigram model
 class BigramLanguageModel(nn.Module):
@@ -104,7 +147,11 @@ class BigramLanguageModel(nn.Module):
         # Each token directly reads off the logits for the next token from a lookup table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd) #embedding table to convert token indices to vectors of size n_embd
         self.positional_embedding_table = nn.Embedding(block_size, n_embd) #embedding table to convert position indices to vectors of size n_embd
-        self.self_attention_head = Head(n_embd) #single head of self-attention
+        self.block = nn.Sequential(
+            Block( n_embd, 4), #stack of n_layer blocks of transformer
+            Block( n_embd, 4),
+            Block( n_embd, 4), # TODO: make this a loop
+        )
         self.lm_head = nn.Linear(n_embd, vocab_size) #linear layer to project the embeddings to the vocabulary size
 
     def forward(self, idx, targets=None):
@@ -115,7 +162,7 @@ class BigramLanguageModel(nn.Module):
         pos = torch.arange(T, device=device) # (T,) tensor of integers from 0 to T-1
         pos_emb = self.positional_embedding_table(pos) # (T,C)
         x = token_emb + pos_emb # (B,T,C) -> This is broadcasting (T,C) to (B,T,C) # x holds the token embeddings and positional embeddings
-        x = self.self_attention_head(x) # (B,T,C) # apply one head of self-attention
+        x = self.block(x) # (B,T,C) # apply the transformer blocks
         logits = self.lm_head(x) # (B,T,vocab_size)
 
         if targets is None:
