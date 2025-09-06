@@ -91,9 +91,49 @@ class BigramLanguageModel(nn.Module):
             targets = targets.view(B*T)
             loss = F.cross_entropy(logits, targets)
         return logits, loss
+    
+    def generate(self, idx, max_new_tokens):
+        # idx is (B, T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # get the predictions
+            logits, _ = self(idx)
+            # focus only on the last time step
+            logits = logits[:, -1, :] # becomes (B, C)
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append the new token to the sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        return idx
 
 # Instantiate the model and move to device
 model = BigramLanguageModel(vocab_size)
 model = model.to(device)
 
-get_batch('train') #example
+# Create a PyTorch optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# Training loop
+for iter in range(max_iters):
+
+    # every once in a while evaluate the loss on train and val sets
+    if iter % eval_interval == 0:
+        losses = estimate_loss()
+        print(f"Iteration {iter}: Train loss {losses['train']:}, Val loss {losses['val']}")
+
+
+    # sample a batch of data
+    xb, yb = get_batch('train')
+
+    # forward pass
+    logits, loss = model(xb, yb)
+
+    # backward pass
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+# generate from the model
+context = torch.zeros((1, 1), dtype=torch.long, device=device) # start with a single zero token
+print(decode(model.generate(context, max_new_tokens=500)[0].tolist())) #generate
